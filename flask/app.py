@@ -1,13 +1,41 @@
-from flask import Flask, render_template, request, redirect, url_for
+from flask import Flask, render_template, request, redirect, url_for, g
 import openai
 import PyPDF2
-from io import BytesIO
 import os
+import sqlite3
+import hashlib
 
 app = Flask(__name__)
 
+DATABASE = 'summaries.db'
+
 # Retrieve API Key from environment variables to prevent hardcoding secrets
 openai.api_key = os.getenv('OPENAI_API_KEY')
+
+def get_db():
+    db = getattr(g, '_database', None)
+    if db is None:
+        db = g._database = sqlite3.connect(DATABASE)
+    return db
+
+@app.teardown_appcontext
+def close_connection(exception):
+    db = getattr(g, '_database', None)
+    if db is not None:
+        db.close()
+
+def init_db():
+    with app.app_context():
+        db = get_db()
+        with app.open_resource('schema.sql', mode='r') as f:
+            db.cursor().executescript(f.read())
+        db.commit()
+
+def query_db(query, args=(), one=False):
+    cur = get_db().execute(query, args)
+    rv = cur.fetchall()
+    cur.close()
+    return (rv[0] if rv else None) if one else rv
 
 def extract_text_from_pdf(pdf_file):
     """
@@ -59,10 +87,23 @@ def upload_file():
         return redirect(url_for('index'))
 
     text = extract_text_from_pdf(uploaded_file)
+    
+    # Create a hash of the PDF content to use as a unique identifier
+    pdf_hash = hashlib.sha256(text.encode()).hexdigest()
 
-    # Handle potential errors during the summarization process
+    # Check if summary exists in the database
+    cached_summary = query_db('SELECT summary FROM summaries WHERE pdf_hash = ?', [pdf_hash], one=True)
+
+    if cached_summary:
+        return render_template('summary.html', summary=cached_summary[0])
+
+    # If no cached summary, continue to get summary from OpenAI
     try:
         summary = openai_summarization(text)
+        # Store the summary in the database
+        db = get_db()
+        db.execute('INSERT INTO summaries (pdf_hash, summary) VALUES (?, ?)', (pdf_hash, summary))
+        db.commit()
     except Exception as e:
         print(f"Error while summarizing: {e}")
         return "Error occurred during summarization.", 500
@@ -70,5 +111,6 @@ def upload_file():
     return render_template('summary.html', summary=summary)
 
 if __name__ == '__main__':
+    if not os.path.exists(DATABASE):
+        init_db()  # This initializes the database on first run only
     app.run(debug=True)
-
