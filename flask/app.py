@@ -51,6 +51,8 @@ def extract_text_from_pdf(pdf_file):
     text = ''.join(page.extract_text() for page in pdf_reader.pages)
     return text
 
+import openai
+
 def openai_summarization(text):
     """
     Summarize the provided text using OpenAI.
@@ -61,13 +63,26 @@ def openai_summarization(text):
     Returns:
         Summarized content.
     """
+    max_tokens = 4000
+    truncation_message = "Note: The original text was truncated due to context length limits."
+    
+    # Truncate text if too long
+    if len(text) > max_tokens:
+        text = text[:max_tokens] + "..."
+    
     response = openai.ChatCompletion.create(
         model="gpt-3.5-turbo",
         messages=[
             {"role": "user", "content": f"Provide a concise and coherent summary of the following text: {text}"},
         ],
     )
-    return response["choices"][0]["message"]["content"]
+    
+    summarized_content = response["choices"][0]["message"]["content"]
+    
+    if len(text) > max_tokens:
+        return summarized_content + " " + truncation_message
+    return summarized_content
+
 
 @app.route('/', methods=['GET'])
 def index():
@@ -81,34 +96,48 @@ def upload_file():
     """
     Handle file upload, extract text from PDF, and summarize it.
     """
-    uploaded_file = request.files['file']
+    uploaded_file = request.files.get('file')
 
+    # Check if a file was actually uploaded
+    if not uploaded_file:
+        return "No file uploaded.", 400
+
+    # Check for empty filename
     if uploaded_file.filename == '':
-        return redirect(url_for('index'))
+        return "Invalid file name.", 400
 
-    text = extract_text_from_pdf(uploaded_file)
-    
+    # Extract text from PDF
+    try:
+        text = extract_text_from_pdf(uploaded_file)
+    except Exception as e:
+        print(f"Error extracting text from PDF: {e}")
+        return "Error processing the PDF file.", 400
+
     # Create a hash of the PDF content to use as a unique identifier
     pdf_hash = hashlib.sha256(text.encode()).hexdigest()
 
     # Check if summary exists in the database
-    cached_summary = query_db('SELECT summary FROM summaries WHERE pdf_hash = ?', [pdf_hash], one=True)
+    try:
+        cached_summary = query_db('SELECT summary FROM summaries WHERE pdf_hash = ?', [pdf_hash], one=True)
+    except Exception as e:
+        print(f"Error querying the database: {e}")
+        return "Error querying the database.", 500
 
     if cached_summary:
         return render_template('summary.html', summary=cached_summary[0])
 
-    # If no cached summary, continue to get summary from OpenAI
+    # Get summary from OpenAI and store in the database
     try:
         summary = openai_summarization(text)
-        # Store the summary in the database
         db = get_db()
         db.execute('INSERT INTO summaries (pdf_hash, summary) VALUES (?, ?)', (pdf_hash, summary))
         db.commit()
     except Exception as e:
-        print(f"Error while summarizing: {e}")
+        print(f"Error while summarizing or storing in the database: {e}")
         return "Error occurred during summarization.", 500
 
     return render_template('summary.html', summary=summary)
+
 
 if __name__ == '__main__':
     if not os.path.exists(DATABASE):

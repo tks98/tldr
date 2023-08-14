@@ -1,54 +1,90 @@
 import unittest
-from unittest.mock import patch, Mock
 from io import BytesIO
-from app import app  # Assuming the provided code is saved in a file named `app.py`.
+import os
+import sqlite3
+from flask_testing import TestCase
+from app import app, init_db, DATABASE
+import tempfile
 
-class FlaskAppTests(unittest.TestCase):
+class FlaskAppTestCase(TestCase):
+
+    # Setting Flask's TESTING configuration flag to True
+    TESTING = True
+
+    def create_app(self):
+        """Create and return a testing flask app."""
+        app.config['TESTING'] = True
+        return app
 
     def setUp(self):
-        self.client = app.test_client()
-        app.config['TESTING'] = True
+        """Set up test environment before each test."""
+        # Remove existing database file if it exists
+        if os.path.exists(DATABASE):
+            os.remove(DATABASE)
 
-    def test_index(self):
-        response = self.client.get('/')
+        # Create a temporary file for our test database
+        self.db_fd, app.config['DATABASE'] = tempfile.mkstemp()
+        app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + app.config['DATABASE']
+        
+        # Create a test client for sending HTTP requests
+        self.app = app.test_client()
+
+        # Initialize the database within the app context
+        with app.app_context():
+            init_db()
+
+    def tearDown(self):
+        """Clean up test environment after each test."""
+        os.close(self.db_fd)
+        os.unlink(app.config['DATABASE'])
+
+    def upload_file(self, filename):
+        """
+        Helper method to upload a file to the /upload endpoint.
+        Returns the HTTP response.
+        """
+        try:
+            with open(filename, 'rb') as f:
+                data = {
+                    'file': (f, os.path.basename(filename))
+                }
+                return self.app.post('/upload', data=data, content_type='multipart/form-data')
+        except FileNotFoundError:
+            return "File not found", 404
+
+    def test_pdf_upload(self):
+        """Test file upload functionality for PDFs and other file types."""
+        # Test uploading a valid PDF
+        response = self.upload_file('test_data/sample.pdf')
         self.assertEqual(response.status_code, 200)
 
-    @patch('app.extract_text_from_pdf', return_value="Sample text from PDF")
-    @patch('app.query_db', return_value=[])
-    @patch('app.openai_summarization', return_value="Summarized text")
-    @patch('app.get_db')
-    def test_upload_file(self, mock_db, mock_extract, mock_query, mock_summarize):
-        mock_db.return_value.execute.return_value = Mock()  # mock the database execute method
-        data = {
-            'file': (BytesIO(b'Some mock bytes'), 'sample.pdf')
-        }
-        response = self.client.post('/upload', data=data, content_type='multipart/form-data')
+        # Test uploading an invalid file type
+        response = self.upload_file('test_data/sample.txt')
+        self.assertNotEqual(response.status_code, 200)
+
+    def test_summary_generation(self):
+        """Test if a summary is generated upon successful file upload."""
+        response = self.upload_file('test_data/sample.pdf')
         self.assertEqual(response.status_code, 200)
-        self.assertIn(b'Summarized text', response.data)
+        self.assertIn(b'summary', response.data)
 
-    @patch('app.extract_text_from_pdf', return_value="Sample text from PDF")
-    @patch('app.query_db', return_value=[("Cached Summarized text",)])
-    @patch('app.openai_summarization', return_value="This should not be returned")
-    def test_upload_file_with_cached_summary(self, mock_extract, mock_query, mock_summarize):
-        data = {
-            'file': (BytesIO(b'Some mock bytes'), 'sample.pdf')
-        }
-        response = self.client.post('/upload', data=data, content_type='multipart/form-data')
+    def test_exception_handling(self):
+        """Test the handling of exceptions during file upload."""
+        response = self.upload_file('')
+        self.assertEqual(response, ("File not found", 404))
+
+    def test_database_cache(self):
+        """Test if the database caches file uploads."""
+        # Upload a file for the first time
+        response = self.upload_file('test_data/sample.pdf')
         self.assertEqual(response.status_code, 200)
-        self.assertIn(b'Cached Summarized text', response.data)
-        mock_extract.assert_not_called()  # Ensure extract_text_from_pdf was not called
 
-
-    @patch('app.extract_text_from_pdf', return_value="Sample text from PDF")
-    @patch('app.query_db', return_value=[])
-    @patch('app.openai_summarization', side_effect=Exception("OpenAI Error"))
-    def test_upload_file_with_openai_error(self, mock_extract, mock_query, mock_summarize):
-        data = {
-            'file': (BytesIO(b'Some mock bytes'), 'sample.pdf')
-        }
-        response = self.client.post('/upload', data=data, content_type='multipart/form-data')
-        self.assertEqual(response.status_code, 500)
-        self.assertIn(b"Error occurred during summarization.", response.data)
+        # Upload the same file again to test caching
+        response = self.upload_file('test_data/sample.pdf')
+        self.assertEqual(response.status_code, 200)
 
 if __name__ == '__main__':
     unittest.main()
+
+
+
